@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ocr-fastapi
+    runtime: docker
+    plan: free        # o starter/pro
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: TESSERACT_CMD
+        value: "/usr/bin/tesseract"   # explícito (opcional)
+    healthCheckPath: /health
+    autoDeploy: true
