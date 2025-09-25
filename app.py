@@ -1,112 +1,200 @@
+# app.py
+import os
+import json
+from typing import Optional, Dict
+
 import requests
 from io import BytesIO
 from PIL import Image
 import cv2, numpy as np
 import pytesseract
 
-# === Ajusta si no tienes Tesseract en PATH ===
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, HttpUrl
 
-IMAGE_URL = "https://appscvsgen.supercias.gob.ec/consultaCompanias/tmp/20128355289982139167780248335891.png"
+# =========================
+# Configuración Tesseract
+# =========================
+# Prioridad:
+# 1) TESSERACT_CMD (env) si existe y es archivo
+# 2) /usr/bin/tesseract (Linux/Render)
+# 3) Ruta típica Windows
+TESS_ENV = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+if os.path.isfile(TESS_ENV):
+    pytesseract.pytesseract.tesseract_cmd = TESS_ENV
+elif os.path.isfile("/usr/bin/tesseract"):
+    pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+elif os.path.isfile(r"C:\Program Files\Tesseract-OCR\tesseract.exe"):
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Si nada coincide, pytesseract usará el PATH del sistema.
 
-HEADERS = {
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="OCR 6 dígitos", version="1.0.0")
+
+# (Opcional) CORS si vas a consumir desde un front
+if os.getenv("ENABLE_CORS", "0").lower() in ("1", "true", "yes", "on"):
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+class OCRRequest(BaseModel):
+    url: HttpUrl
+    cookies: Optional[Dict[str, str]] = None
+    referer: Optional[str] = "https://appscvsgen.supercias.gob.ec/consultaCompanias/"
+
+class OCRResponse(BaseModel):
+    ok: bool
+    digits: Optional[str] = None
+    length: Optional[int] = None
+    line_guess: Optional[str] = None
+    seg_guess: Optional[str] = None
+    error: Optional[str] = None
+
+# =========================
+# Config y helpers
+# =========================
+DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-    "Referer": "https://appscvsgen.supercias.gob.ec/consultaCompanias/",
     "Accept-Language": "es-EC,es;q=0.9,en;q=0.8",
 }
-COOKIES = {
-    # "JSESSIONID": "SI REQUIERE SESION, PEGA TU COOKIE AQUI"
-}
+DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes", "on")
 
-# ---------- Utilidades ----------
 def keep_digits(s: str) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 def resize3(pil_img: Image.Image) -> Image.Image:
     w, h = pil_img.size
-    return pil_img.resize((w*3, h*3), resample=Image.BICUBIC)
+    return pil_img.resize((max(1, w*3), max(1, h*3)), resample=Image.BICUBIC)
 
-# ---------- Descarga ----------
-def download_image_bytes(url):
-    r = requests.get(url, headers=HEADERS, cookies=COOKIES, timeout=20, allow_redirects=True)
-    open("debug_response.bin", "wb").write(r.content)
-    print("Status:", r.status_code, "Content-Type:", r.headers.get("Content-Type"), "Len:", len(r.content))
+# =========================
+# Descarga imagen
+# =========================
+def download_image_bytes(url: str, referer: Optional[str], cookies: Optional[Dict[str, str]]) -> bytes:
+    headers = DEFAULT_HEADERS.copy()
+    if referer:
+        headers["Referer"] = referer
+
+    cookies_final = cookies or {}
+    # Permite inyectar cookies vía env COOKIES_JSON si no vienen en el payload
+    if not cookies_final:
+        cj = os.getenv("COOKIES_JSON", "").strip()
+        if cj:
+            try:
+                cookies_final = json.loads(cj)
+            except Exception:
+                cookies_final = {}
+
+    r = requests.get(url, headers=headers, cookies=cookies_final, timeout=20, allow_redirects=True)
+
     if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}")
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "image" not in ctype and not r.content.startswith(b"\x89PNG\r\n\x1a\n"):
-        open("debug_response.html", "wb").write(r.content)
-        raise RuntimeError("No llegó imagen. Revisa debug_response.html")
-    return r.content
+        if DEBUG:
+            try:
+                with open("debug_response.bin", "wb") as f:
+                    f.write(r.content)
+            except Exception:
+                pass
+        raise HTTPException(status_code=502, detail=f"HTTP {r.status_code} al pedir la imagen")
 
-def pil_from_bytes(img_bytes):
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    content = r.content
+    # Acepta image/* o PNG por firma
+    if "image" not in ctype and not content.startswith(b"\x89PNG\r\n\x1a\n"):
+        if DEBUG:
+            try:
+                with open("debug_response.html", "wb") as f:
+                    f.write(content)
+            except Exception:
+                pass
+        raise HTTPException(status_code=400, detail="La URL no devolvió una imagen (¿sesión/cookies requeridas?).")
+
+    if DEBUG:
+        try:
+            with open("debug_image.bin", "wb") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+    return content
+
+def pil_from_bytes(img_bytes: bytes) -> Image.Image:
     try:
         return Image.open(BytesIO(img_bytes)).convert("RGB")
     except Exception:
         arr = np.frombuffer(img_bytes, np.uint8)
         img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img_bgr is None:
-            raise RuntimeError("Bytes no son imagen válida.")
+            raise HTTPException(status_code=400, detail="Bytes no representan una imagen válida.")
         return Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
-# ---------- Preprocesado (línea completa) ----------
-def preprocess_for_line_ocr(pil_img):
+# =========================
+# Preprocesado (línea completa, conservador 0→8)
+# =========================
+def preprocess_for_line_ocr(pil_img: Image.Image) -> Image.Image:
     pil_img = resize3(pil_img)
     img = np.array(pil_img)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # OTSU: más estable para fondo simple; invertimos a texto oscuro sobre claro
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    # Morfología MUY suave (evitar convertir 0 en 8)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
     opened = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
-    inv = cv2.bitwise_not(opened)  # texto oscuro / fondo claro
-    cv2.imwrite("captcha_proc_line.png", inv)
+    inv = cv2.bitwise_not(opened)  # texto oscuro sobre fondo claro
+    if DEBUG:
+        cv2.imwrite("captcha_proc_line.png", inv)
     return Image.fromarray(inv)
 
-# ---------- Preprocesado (segmentación por contornos) ----------
-def preprocess_for_digit_segments(pil_img):
+# =========================
+# Preprocesado (segmentación por contornos)
+# =========================
+def preprocess_for_digit_segments(pil_img: Image.Image) -> np.ndarray:
     pil_img = resize3(pil_img)
     img = np.array(pil_img)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # OTSU en modo texto BLANCO sobre fondo NEGRO (útil para contornos)
-    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Nada de closing aquí (puede “partir” 0 en 8). Solo un open muy leve si hay puntitos:
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  # texto BLANCO sobre fondo NEGRO
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
     cleaned = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
-    cv2.imwrite("captcha_proc_segment.png", cleaned)
-    return cleaned  # texto claro (255)
+    if DEBUG:
+        cv2.imwrite("captcha_proc_segment.png", cleaned)
+    return cleaned
 
-# ---------- OCR (línea completa) ----------
-def ocr_line(pil_img):
+# =========================
+# OCR (línea)
+# =========================
+def ocr_line(pil_img: Image.Image) -> str:
     cfg = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789 -c load_system_dawg=0 -c load_freq_dawg=0'
     raw = pytesseract.image_to_string(pil_img, config=cfg)
     return keep_digits(raw)
 
-# ---------- Huecos en un recorte ----------
-def count_holes(bin_crop_white_fg):
-    """
-    bin_crop_white_fg: binario con texto blanco (255) sobre fondo negro (0)
-    Usamos jerarquía de contornos: los contornos con parent != -1 son huecos.
-    """
+# =========================
+# Huecos (0 vs 8)
+# =========================
+def count_holes(bin_crop_white_fg: np.ndarray) -> int:
     cnts, hier = cv2.findContours(bin_crop_white_fg, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hier is None:
         return 0
     holes = 0
-    for i, h in enumerate(hier[0]):
+    for h in hier[0]:
         parent = h[3]
         if parent != -1:
             holes += 1
     return holes
 
-# ---------- OCR (por dígito con contornos + corrección 0/8) ----------
-def ocr_by_segments(bin_img):
+# =========================
+# OCR por segmentos + corrección 0/8
+# =========================
+def ocr_by_segments(bin_img: np.ndarray) -> str:
     contours, _ = cv2.findContours(bin_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes = []
     H, W = bin_img.shape[:2]
-
     MIN_H = H * 0.25
     MIN_W = W * 0.015
+
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         if h >= MIN_H and w >= MIN_W:
@@ -115,8 +203,6 @@ def ocr_by_segments(bin_img):
         return ""
 
     boxes.sort(key=lambda b: b[0])
-
-    # Heurística: quitar “palitos” demasiado angostos
     widths = [w for (_,_,w,_) in boxes]
     median_w = np.median(widths) if widths else 0
     NARROW_DROP_RATIO = 0.45
@@ -129,10 +215,9 @@ def ocr_by_segments(bin_img):
         x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
         crop = bin_img[y0:y1, x0:x1]  # texto BLANCO
 
-        # Normaliza tamaño
         target_h = 64
-        scale = target_h / crop.shape[0]
-        crop_resized = cv2.resize(crop, (int(crop.shape[1]*scale), target_h), interpolation=cv2.INTER_CUBIC)
+        scale = target_h / max(1, crop.shape[0])
+        crop_resized = cv2.resize(crop, (max(1, int(crop.shape[1]*scale)), target_h), interpolation=cv2.INTER_CUBIC)
 
         # OCR: invertir a oscuro sobre claro
         crop_inv = cv2.bitwise_not(crop_resized)
@@ -140,76 +225,89 @@ def ocr_by_segments(bin_img):
         cfg = r'--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789 -c load_system_dawg=0 -c load_freq_dawg=0'
         ch = keep_digits(pytesseract.image_to_string(pil_digit, config=cfg))
 
-        # === Corrección por huecos (0 vs 8) ===
-        holes = count_holes(crop_resized)  # usar el binario con texto blanco
+        # Corrección morfológica 0 vs 8
+        holes = count_holes(crop_resized)  # usar binario blanco
         if holes == 1 and (ch == "" or ch == "8"):
             ch = "0"
         elif holes == 2:
-            ch = "8"  # si Tesseract dijo 0 pero hay 2 huecos, forzamos 8
+            ch = "8"
 
         if len(ch) == 1:
             digits.append(ch)
         elif len(ch) > 1:
             digits.append(ch[0])
         else:
-            # si no reconoció, intenta una segunda pasada con psm 13
             cfg2 = r'--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789'
             ch2 = keep_digits(pytesseract.image_to_string(pil_digit, config=cfg2))
             digits.append(ch2[:1] if ch2 else "")
 
     return "".join(d for d in digits if d)
 
-# ---------- Selección final a 6 dígitos ----------
+# =========================
+# Elección final a 6 dígitos
+# =========================
 def choose_best_six(line_guess: str, seg_guess: str) -> str:
     candidates = []
-    for g in [line_guess, seg_guess]:
+    for g in (line_guess, seg_guess):
         if not g:
             continue
         g = keep_digits(g)
-        if len(g) > 6:
-            # recorte conservador: quita un '1' suelto si hay >1
-            if g.count('1') >= 2:
-                g = g.replace('1', '', 1)
+        if len(g) > 6 and g.count('1') >= 2:
+            g = g.replace('1', '', 1)
         g = g[:6]
         candidates.append(g)
 
-    exact_six = [c for c in candidates if len(c) == 6]
-    if exact_six:
-        # Heurística: penaliza '8' si el otro candidato tiene '0' en esa posición
-        # (ya que 0→8 es el error típico)
-        def penalty(s):
-            return s.count('8')
-        exact_six.sort(key=penalty)
-        return exact_six[0]
-
+    exact = [c for c in candidates if len(c) == 6]
+    if exact:
+        exact.sort(key=lambda s: s.count('8'))  # penaliza 8's por el típico 0->8
+        return exact[0]
     return (max(candidates, key=len)[:6] if candidates else "")
 
-# ---------- Main ----------
-def main():
-    try:
-        img_bytes = download_image_bytes(IMAGE_URL)
-    except Exception as e:
-        print("Error descargando la imagen:", e)
-        print("Revisa: debug_response.bin y/o debug_response.html")
-        return
-
+# =========================
+# Orquestador
+# =========================
+def process_url(url: str, cookies: Optional[Dict[str, str]], referer: Optional[str]) -> Dict[str, str]:
+    img_bytes = download_image_bytes(url, referer, cookies)
     pil_raw = pil_from_bytes(img_bytes)
-    pil_raw.save("captcha_raw.png")
 
-    # Pasada A (línea)
     pil_line = preprocess_for_line_ocr(pil_raw)
     guess_line = ocr_line(pil_line)
-    print("LINE (raw):", guess_line)
 
-    # Pasada B (segmentos con corrección morfológica 0/8)
     bin_seg = preprocess_for_digit_segments(pil_raw)
     guess_seg = ocr_by_segments(bin_seg)
-    print("SEGS (raw):", guess_seg)
 
     final6 = choose_best_six(guess_line, guess_seg)
-    print("RESULTADO (6 dígitos):", final6)
+    if not final6 or len(final6) != 6:
+        raise HTTPException(status_code=422, detail=f"No se pudo obtener 6 dígitos (line='{guess_line}', seg='{guess_seg}').")
 
-    print("Archivos:", "captcha_raw.png", "captcha_proc_line.png", "captcha_proc_segment.png", "debug_response.bin")
+    return {"digits": final6, "line_guess": guess_line, "seg_guess": guess_seg}
 
+# =========================
+# Rutas
+# =========================
+@app.get("/")
+def root():
+    return {"name": "ocr-6-digitos", "version": "1.0.0", "endpoints": ["/health", "/ocr-url"]}
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/ocr-url", response_model=OCRResponse)
+def ocr_url(payload: OCRRequest):
+    try:
+        result = process_url(payload.url, payload.cookies, payload.referer)
+        return OCRResponse(ok=True, digits=result["digits"], length=6,
+                           line_guess=result["line_guess"], seg_guess=result["seg_guess"])
+    except HTTPException as e:
+        return OCRResponse(ok=False, error=e.detail)
+    except pytesseract.TesseractNotFoundError:
+        return OCRResponse(ok=False, error="Tesseract no está instalado o no está en PATH/TESSERACT_CMD.")
+    except Exception as e:
+        return OCRResponse(ok=False, error=str(e))
+
+# Para correr local:
+# uvicorn app:app --host 0.0.0.0 --port 8000
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)

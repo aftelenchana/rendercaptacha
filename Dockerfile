@@ -23,15 +23,15 @@ WORKDIR /app
 
 # Instalar dependencias Python (primero requirements para cache)
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copiar el código
 COPY . .
 
 # Render asigna el puerto en la variable de entorno PORT
-# Exponerlo solo como metadata (no obligatorio para Render)
 EXPOSE 10000
 
 # Comando de arranque: gunicorn con uvicorn worker
 # Cambia "app:app" si tu archivo se llama distinto (p. ej. index:app)
-CMD gunicorn -k uvicorn.workers.UvicornWorker -w 1 -b 0.0.0.0:${PORT:-10000} app:app
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "-w", "1", "-b", "0.0.0.0:${PORT:-10000}", "app:app"]
